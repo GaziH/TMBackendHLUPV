@@ -22,20 +22,23 @@ pub struct AppState{
 }
 #[tokio::main]
 async fn main() {
-    println!("Hello, world!");
+
+    // Create Default Vehicle
     let vehicle = Arc::new(Mutex::new(PayloadVehicle{
         position_m: 0.0,
         velocity_kmh: 0.0,
         acceleration_ms2: 0.0,
-        mass_kg: 40.0,
+        mass_kg: 0.0,
         voltage_v: 0.0,
         current_a: 0.0,
         state: State::IDLE,
         timestamp: chrono::Utc::now().to_rfc3339()
     }));
 
+    // Create Broadcast Channel, tx send, rx recieve
     let (tx,  _rx) = broadcast::channel::<String>(100);
 
+    // Create State of the app
     let app_state = AppState{
         vehicle: vehicle.clone(),
         tx: tx.clone()
@@ -43,6 +46,7 @@ async fn main() {
 
     tokio::spawn(tick_physics(vehicle.clone(),tx.clone()));
 
+    //Websocket to send logs
     let ws_app = Router::new()
         .route("/backend/stream", get(ws_handler))
         .with_state(app_state.clone())
@@ -55,6 +59,7 @@ async fn main() {
         axum::serve(ws_listener, ws_app).await.unwrap()
     });
 
+    //Http TCP to recieve commands reliably
     let http_app = Router::new()
         .route("/api/command",post(handle_command))
         .route("/api/calculate",get(handle_calculate))
@@ -71,19 +76,17 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     AxumState(state): AxumState<AppState>,
 ) -> impl IntoResponse {
-    // Upgrade the HTTP request to a WebSocket connection
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
-    // Subscribe to the broadcast channel
+    // Sub to broadcast channel
     let mut rx = state.tx.subscribe();
 
-    // Loop and wait for messages on the channel
+    // Loop and wait for messages
     while let Ok(msg) = rx.recv().await {
-        // Send the message over the WebSocket to the frontend
+        // Send message on websocket
         if socket.send(Message::Text(msg)).await.is_err() {
-            // If send fails, the client probably disconnected
             break;
         }
     }

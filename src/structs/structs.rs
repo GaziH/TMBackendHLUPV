@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-
+use crate::commands::commands::Command;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum State{
@@ -55,17 +55,23 @@ pub struct Message{
     pub(crate) payload: PayloadMessage,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct CommandRequest{
+    pub command: Command,
+    pub payload: Option<StartPayload>
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct StartPayload{
+    pub mass: f32
+}
 
 
-
-
-// #[derive(Deserialize)]
-// pub struct CalculateQuery {
-//     pub m: f32,
-//     pub d: f32,
-// }
-
-// 2. Define the exact JSON structure the frontend expects back
+#[derive(Deserialize)]
+pub struct CalculateQuery {
+    pub m: f32,
+    pub d: f32,
+}
 #[derive(Serialize)]
 pub struct CalculateResponse {
     pub(crate) braking_position_m: f32,

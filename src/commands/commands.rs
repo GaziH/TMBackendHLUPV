@@ -3,8 +3,8 @@ use axum::Json;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use crate::AppState;
-use crate::structs::structs::{CalculateResponse, Message, MessageType, PayloadMessage, PayloadVehicle, State, Topic};
-use axum::extract::{State as AxumState};
+use crate::structs::structs::{CalculateQuery, CalculateResponse, CommandRequest, Message, MessageType, PayloadMessage, PayloadVehicle, State, Topic};
+use axum::extract::{Query, State as AxumState};
 
 #[derive(Serialize,Deserialize)]
 pub enum Command{
@@ -15,15 +15,23 @@ pub enum Command{
 }
 pub async fn handle_command(
     AxumState(state): AxumState<AppState>,
-    Json(command): Json<Command>
+    Json(command_request): Json<CommandRequest>
 ) -> impl IntoResponse {
     let mut vehicle = state.vehicle.lock().await;
-    let msg = match command {
+    
+    let msg = match command_request.command {
         Command::PRECHARGE => {
             precharge_command(&mut vehicle).await
         }
         Command::START => {
-            start_command(&mut vehicle).await
+            match command_request.payload{
+                Some(payload) => {
+                    start_command(&mut vehicle, payload.mass).await // Carefully unwrap payload (if no payload, everything crashed)
+                }
+                None => {
+                    return StatusCode::BAD_REQUEST // No payload -> 400
+                }
+            }
         }
         Command::BRAKE => {
             brake_command(&mut vehicle).await
@@ -32,22 +40,24 @@ pub async fn handle_command(
             reset_command(&mut vehicle).await
         }
     };
+    
+    //All return a Message struct
 
     let code = if msg.payload.message_type == MessageType::error{
         StatusCode::BAD_REQUEST
     }else{
         StatusCode::OK
     };
-
+    
     if let Ok(json_string) = serde_json::to_string(&msg) {
-        let _ = state.tx.send(json_string);
+        let _ = state.tx.send(json_string); // Send message
     }
 
-    code
+    code //return code
 }
 
 pub async fn precharge_command(vehicle: &mut PayloadVehicle) -> Message{
-    if vehicle.state!=State::IDLE || vehicle.voltage_v!=0.0{
+    if vehicle.state!=State::IDLE || vehicle.voltage_v!=0.0{ // If idle or velocity !=0 -> 400
         return Message{
             topic: Topic::message,
             payload: PayloadMessage{
@@ -56,7 +66,7 @@ pub async fn precharge_command(vehicle: &mut PayloadVehicle) -> Message{
             }
         };
     }
-    vehicle.state = State::PRECHARGE;
+    vehicle.state = State::PRECHARGE; // Set next state
     Message{
         topic: Topic::message,
         payload: PayloadMessage{
@@ -66,8 +76,8 @@ pub async fn precharge_command(vehicle: &mut PayloadVehicle) -> Message{
     }
 }
 
-pub async fn start_command(vehicle: &mut PayloadVehicle) -> Message{
-    if vehicle.state!=State::READY || vehicle.voltage_v<400.0{
+pub async fn start_command(vehicle: &mut PayloadVehicle, mass: f32) -> Message{
+    if vehicle.state!=State::READY || vehicle.voltage_v<400.0{ // if in any state not READY or Voltage < 400V -> 400
         return Message{
             topic: Topic::message,
             payload: PayloadMessage{
@@ -76,7 +86,8 @@ pub async fn start_command(vehicle: &mut PayloadVehicle) -> Message{
             }
         }
     };
-    vehicle.state = State::RUNNING;
+    vehicle.state = State::RUNNING; // Set next state
+    vehicle.mass_kg=mass;
     vehicle.velocity_kmh=4.0;
     Message{
         topic: Topic::message,
@@ -88,7 +99,7 @@ pub async fn start_command(vehicle: &mut PayloadVehicle) -> Message{
 }
 
 pub async fn brake_command(vehicle: &mut PayloadVehicle) -> Message{
-    if vehicle.state!=State::RUNNING && vehicle.state!=State::BOOSTING{
+    if vehicle.state!=State::RUNNING && vehicle.state!=State::BOOSTING{ // If not in any moving state -> 400
         return Message{
             topic: Topic::message,
             payload: PayloadMessage{
@@ -97,7 +108,7 @@ pub async fn brake_command(vehicle: &mut PayloadVehicle) -> Message{
             }
         }
     };
-    vehicle.state = State::BRAKING;
+    vehicle.state = State::BRAKING; // Set next state
     Message{
         topic: Topic::message,
         payload: PayloadMessage{
@@ -108,13 +119,16 @@ pub async fn brake_command(vehicle: &mut PayloadVehicle) -> Message{
 }
 
 pub async fn reset_command(vehicle: &mut PayloadVehicle) -> Message{
-    vehicle.state = State::IDLE;
-    vehicle.mass_kg=40.0;
+    vehicle.state = State::IDLE; // Set next state
+    
+    // Set all to 0
+    vehicle.mass_kg=0.0;
     vehicle.acceleration_ms2=0.0;
     vehicle.velocity_kmh=0.0;
     vehicle.position_m=0.0;
     vehicle.current_a = 0.0;
     vehicle.voltage_v=0.0;
+    
     Message{
         topic: Topic::message,
         payload: PayloadMessage{
@@ -127,26 +141,22 @@ pub async fn reset_command(vehicle: &mut PayloadVehicle) -> Message{
 
 
 
-pub async fn handle_calculate() -> Result<Json<CalculateResponse>, StatusCode> {
-    //    Query(params): Query<CalculateQuery>,
+pub async fn handle_calculate(Query(params): Query<CalculateQuery>,) -> Result<Json<CalculateResponse>, StatusCode> { //Calculate distance to brake from in order to stop given distance away from barrier.
 
-    // if params.m < 0.0 || params.d < 0.0 {
-    //     return Err(StatusCode::BAD_REQUEST);
-    // }
-
-    let v0_ms: f32 = 25.0 / 3.6;
-    let f_brake: f32 = 196.0;
-
-    // let d_brake = (v0_ms.powf(2.0) * params.m) / (2.0 * f_brake);
-    let d_brake = (v0_ms.powf(2.0) * 40.0) / (2.0 * f_brake);
-
-    // let s_brake = (50.0 - params.d) - d_brake;
-    let s_brake = (50.0 - 0.0) - d_brake;
-    if s_brake < 0.0 {
+    if params.m < 0.0 || params.d < 0.0 { // Invalid inputs -> 400
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Return the calculated value as HTTP 200 OK with JSON body
+    let v0_ms: f32 = 25.0 / 3.6;
+    let braking_force: f32 = 196.0;
+
+    let d_brake = (v0_ms.powf(2.0) * params.m) / (2.0 * braking_force);
+
+    let s_brake = (50.0 - params.d) - d_brake;
+    if s_brake < 0.0 { // Impossible result (negative) -> 400
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     Ok(Json(CalculateResponse {
         braking_position_m: s_brake,
     }))

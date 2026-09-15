@@ -1,72 +1,90 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::time::{interval, Duration};
-use crate::structs::structs::{PayloadVehicle, State};
+use axum::extract::{State as AxumState, WebSocketUpgrade};
+use axum::extract::ws::{Message, WebSocket};
+use axum::response::IntoResponse;
+use axum::{ Router};
+use axum::routing::{get, post};
+use tokio::net::TcpListener;
+use tokio::sync::{broadcast, Mutex};
+use tower_http::cors::CorsLayer;
+use crate::commands::commands::{handle_calculate, handle_command};
+use crate::commands::physics::tick_physics;
+use crate::structs::structs::{ PayloadVehicle, State};
 
 pub mod structs;
 pub mod commands;
+pub mod messages;
 
-fn main() {
+#[derive(Clone)]
+pub struct AppState{
+    pub vehicle: Arc<Mutex<PayloadVehicle>>,
+    pub tx: broadcast::Sender<String>
+}
+#[tokio::main]
+async fn main() {
     println!("Hello, world!");
+    let vehicle = Arc::new(Mutex::new(PayloadVehicle{
+        position_m: 0.0,
+        velocity_kmh: 0.0,
+        acceleration_ms2: 0.0,
+        mass_kg: 40.0,
+        voltage_v: 0.0,
+        current_a: 0.0,
+        state: State::IDLE,
+        timestamp: chrono::Utc::now().to_rfc3339()
+    }));
+
+    let (tx,  _rx) = broadcast::channel::<String>(100);
+
+    let app_state = AppState{
+        vehicle: vehicle.clone(),
+        tx: tx.clone()
+    };
+
+    tokio::spawn(tick_physics(vehicle.clone(),tx.clone()));
+
+    let ws_app = Router::new()
+        .route("/backend/stream", get(ws_handler))
+        .with_state(app_state.clone())
+        .layer(CorsLayer::permissive());
+
+    let ws_listener = TcpListener::bind("0.0.0.0:5001").await.unwrap();
+
+    tokio::spawn(async move{
+        println!("Starting websocket server");
+        axum::serve(ws_listener, ws_app).await.unwrap()
+    });
+
+    let http_app = Router::new()
+        .route("/api/command",post(handle_command))
+        .route("/api/calculate",get(handle_calculate))
+        .with_state(app_state.clone())
+        .layer(CorsLayer::permissive());
+
+    let http_listener = TcpListener::bind("0.0.0.0:8001").await.unwrap();
+
+    println!("HTTP API running on http://localhost:8001");
+    axum::serve(http_listener, http_app).await.unwrap();
 }
 
-async fn tick_physics(vehicle: Arc<Mutex<PayloadVehicle>>) {
-    let mut ticker = interval(Duration::from_millis(250));
-    let physical_time = 0.05;
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    AxumState(state): AxumState<AppState>,
+) -> impl IntoResponse {
+    // Upgrade the HTTP request to a WebSocket connection
+    ws.on_upgrade(|socket| handle_socket(socket, state))
+}
 
-    loop{
-        ticker.tick().await;
-        let mut vehicle = vehicle.lock().await;
+async fn handle_socket(mut socket: WebSocket, state: AppState) {
+    // Subscribe to the broadcast channel
+    let mut rx = state.tx.subscribe();
 
-        match vehicle.state {
-            State::IDLE => {
-
-            }
-            State::PRECHARGE => {
-                vehicle.voltage_v+=25.0;
-                if(vehicle.voltage_v >=400.0){
-                    vehicle.state = State::READY;
-                }
-            }
-            State::READY => {
-
-            }
-            State::RUNNING =>{ // Calculate Position with constant Velocity
-                if(vehicle.position_m>=2.0 && vehicle.position_m<=4.0){ // If in Booster zone
-                    vehicle.state = State::BOOSTING;
-                    continue;
-                }
-                if(vehicle.position_m>=50.0){ // If hits barrier
-                    vehicle.state = State::STOPPED;
-                    continue;
-                }
-                vehicle.position_m += (vehicle.velocity_kmh/3.6) * physical_time; // Position
-
-
-            }
-            State::BOOSTING => { // Calculate Acceleration, then update Velocity and Position
-                if(vehicle.position_m>=4.0){
-                    vehicle.velocity_kmh=25.0;
-                    vehicle.state = State::RUNNING;
-                    continue;
-                }
-                let target_velocity_ms: f32 = (25.0/3.6);
-
-                vehicle.acceleration_ms2=( target_velocity_ms.powf(2.0) * (vehicle.velocity_kmh/3.6).powf(2.0) ) // Acceleration
-                                                    / (2.0*(4.0-vehicle.position_m) );
-
-                let force = vehicle.acceleration_ms2*vehicle.mass_kg;
-
-                vehicle.velocity_kmh += (vehicle.acceleration_ms2*physical_time) * 3.6; // Velocity
-
-                vehicle.position_m += (vehicle.velocity_kmh/3.6) * physical_time; // Position
-            }
-            State::BRAKING =>{
-
-            }
-            State::STOPPED =>{
-
-            }
+    // Loop and wait for messages on the channel
+    while let Ok(msg) = rx.recv().await {
+        // Send the message over the WebSocket to the frontend
+        if socket.send(Message::Text(msg)).await.is_err() {
+            // If send fails, the client probably disconnected
+            break;
         }
     }
 }
